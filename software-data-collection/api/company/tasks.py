@@ -4,7 +4,7 @@ import datetime
 import time
 from langdetect import detect
 from ai.embedder import Embedder 
-from ai.nlp import preprocess, text_to_chunks
+from ai.nlp import  text_to_chunks,text_processing
 from ai.semantic_retrieval import SemanticSimilarityCalculator
 from api.airtable import get_all_records_from_table
 from api.celery import app
@@ -48,6 +48,55 @@ def _clean_url(url):
     return url
 
 
+def update_gpt_state(file_path):
+    '''Updates status of gpt to allow sending data to GPT for a given company names inside of a CSV file'''
+    df = pd.read_csv(file_path)
+    at = airtable.Airtable(settings.AIRTABLE_COMPANY_BASE_ID, settings.AIRTABLE_TOKEN)
+    airtable_companies_to_scrap = get_all_records_from_table(
+            at, 
+            settings.AIRTABLE_COMPANY_WEBSITE_TABLE_ID
+        )
+    df['Name'] = df['Name'].str.lower().str.strip()
+    
+    companies_from_csv = df['Name'].unique().tolist()
+    companies_to_resend = [row['id'] for row in airtable_companies_to_scrap if row['fields']['Name'].lower().strip() in companies_from_csv ]
+    for company in companies_to_resend:
+        at.update(
+            settings.AIRTABLE_COMPANY_WEBSITE_TABLE_ID,
+            company,
+            {
+                "AI info extracted": "No",
+            },
+        )
+        
+        
+def update_scraping_state(file_path):
+    '''Updates status of scraping to allow scraping website content for a given company names inside of a CSV file'''
+   
+    df = pd.read_csv(file_path)
+    at = airtable.Airtable(settings.AIRTABLE_COMPANY_BASE_ID, settings.AIRTABLE_TOKEN)
+    airtable_companies_to_scrap = get_all_records_from_table(
+            at, 
+            settings.AIRTABLE_COMPANY_WEBSITE_TABLE_ID
+        )
+    df['Name'] = df['Name'].str.lower().str.strip()
+    
+    companies_from_csv = df['Name'].unique().tolist()
+    print(companies_from_csv)
+    companies_to_resend = [row['id'] for row in airtable_companies_to_scrap if row['fields']['Name'].lower().strip() in companies_from_csv ]
+    #print(companies_to_resend)
+    for company in companies_to_resend:
+        #print(company)
+        at.update(
+            settings.AIRTABLE_COMPANY_WEBSITE_TABLE_ID,
+            company,
+            {
+                "Scrapped": "No",
+            },
+        )
+   
+
+
 @app.task(bind=True)
 def sync_companies_to_gsheet(self):
     at = airtable.Airtable(settings.AIRTABLE_COMPANY_BASE_ID, settings.AIRTABLE_TOKEN)
@@ -89,6 +138,12 @@ def sync_companies_to_gsheet(self):
         )
 
     return companies_to_scrap
+
+def add_http(url):
+    
+    if not url.startswith('http://') and not url.startswith('https://'):
+        url = 'http://' + url
+    return url
 
 
 @app.task(bind=True)
@@ -250,21 +305,22 @@ def planify_answer_questions(self):
 
 @app.task(bind=True)
 def answer_question(
-    self, company_airtable_id, company_s3_paths, prompt_context, items_to_extract
+    self, company_airtable_id,company_name, company_s3_paths, prompt_context, items_to_extract
 ):
+    print(company_name)
     at = airtable.Airtable(
         settings.AIRTABLE_COMPANY_WEBSITE_BASE_ID, settings.AIRTABLE_TOKEN
     )
+    
     questions = at.get(settings.AIRTABLE_QUESTIONS_QUERIES_ID)["records"][0]["fields"]
-
     content = ""
     for company_s3_path in company_s3_paths.split(";"):
         source_page = load_text_file_from_s3(company_s3_path)
         webpage_text_extracted = extract_text_from_webpage(source_page, items_to_extract)
         content += f"\n\n {webpage_text_extracted}"
-
+   
     # Embed and chuck the text
-    texts = preprocess(content)
+    texts = text_processing(content)
 
     if not texts:
         at.update(
@@ -287,11 +343,11 @@ def answer_question(
     for embedding, chunk in zip(embeddings, chunks):
         chunk_embeddings.append({"embedding": embedding.tolist(), "chunk": chunk})
 
+
     results = []
+    
     for question_key, question_value in questions.items():
         try:
-            # Retrieve the top 5 chunks
-            # Embed question
             question_embedding = embedder.get_text_embedding([question_value])
 
             semantic_calculator = SemanticSimilarityCalculator(chunk_embeddings, n_neighbors=5)
@@ -306,18 +362,39 @@ def answer_question(
             prompt += f"\n\n{prompt_context.replace('<QUESTION>', question_value)}"
 
             answer = generate_gpt_answer(prompt)
-            at.update(
-                settings.AIRTABLE_COMPANY_WEBSITE_TABLE_ID,
-                company_airtable_id,
-                {
-                    question_key: answer,
-                    "AI info extracted": "Yes",
-                    "Text provided to GPT": prompt,
-                },
-            )
+            
+            if question_key == 'category':
+                at.update(
+                    settings.AIRTABLE_COMPANY_WEBSITE_TABLE_ID,
+                    company_airtable_id,
+                    {
+                        question_key: answer,
+                        "AI info extracted": "Yes",
+                        "Text provided to GPT": prompt,
+                        "category_question_value": question_value,
+                        "category_last_answer_date": str(datetime.datetime.now()),
+                    },
+                )
+            elif question_key == 'main category':
+                print('update main category')
+                at.update(
+                    settings.AIRTABLE_COMPANY_WEBSITE_TABLE_ID,
+                    company_airtable_id,
+                    {
+                        question_key: answer,
+                        "AI info extracted": "Yes",
+                        "Text provided to GPT": prompt,
+                        "main_category_question_value": question_value,
+                        "main_category_last_answer_date": str(datetime.datetime.now()),
+                    },
+                )
+                
             results.append({"question": question_key, "answer": answer})
             time.sleep(2)
         except Exception as e:
             print(e)
             continue
     return results
+
+
+
